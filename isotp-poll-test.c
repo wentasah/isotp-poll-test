@@ -28,6 +28,9 @@ int main(int argc, char *argv[])
     char opt;
     bool in = false, out = false;
     bool validate_seq = false;
+    bool blocking = false;
+    bool wait_tx_done = false;
+    bool quiet = false;
     int buf_size = 0;
     unsigned cnt = 1, max_msgs = 0;
 
@@ -35,10 +38,13 @@ int main(int argc, char *argv[])
     addr.can_addr.tp.tx_id = 0x123;
     addr.can_addr.tp.rx_id = 0x321;
 
-    while ((opt = getopt(argc, argv, "ac:d:ios:")) != -1) {
+    while ((opt = getopt(argc, argv, "abc:d:ioqs:w")) != -1) {
         switch (opt) {
         case 'a':
             validate_seq = true;
+            break;
+        case 'b':
+            blocking = true;
             break;
         case 'c':
             max_msgs = atol(optarg);
@@ -48,6 +54,12 @@ int main(int argc, char *argv[])
             break;
         case 'o':
             out = true;
+            break;
+        case 'q':
+            quiet = true;
+            break;
+        case 'w':
+            wait_tx_done = true;
             break;
         case 's':
             addr.can_addr.tp.tx_id = strtoul(optarg, NULL, 16);
@@ -66,6 +78,11 @@ int main(int argc, char *argv[])
 
     sock = CHECK(socket(PF_CAN, SOCK_DGRAM, CAN_ISOTP));
 
+    if (wait_tx_done) {
+        struct can_isotp_options opts = { .flags = CAN_ISOTP_WAIT_TX_DONE};
+        CHECK(setsockopt(sock, SOL_CAN_ISOTP, CAN_ISOTP_OPTS, &opts, sizeof(opts)));
+    }
+
     const char *ifname = "vcan0";
     addr.can_family = AF_CAN;
     addr.can_ifindex = if_nametoindex(ifname);
@@ -74,8 +91,10 @@ int main(int argc, char *argv[])
 
     CHECK(bind(sock, (struct sockaddr *)&addr, sizeof(addr)));
 
-    int flags = CHECK(fcntl(sock, F_GETFL, 0));
-    CHECK(fcntl(sock, F_SETFL, flags | O_NONBLOCK));
+    if (!blocking) {
+        int flags = CHECK(fcntl(sock, F_GETFL, 0));
+        CHECK(fcntl(sock, F_SETFL, flags | O_NONBLOCK));
+    }
 
     struct pollfd pollfd = {
         .fd = sock,
@@ -86,11 +105,13 @@ int main(int argc, char *argv[])
         char buf[100];
         int ret;
 
-        CHECK(poll(&pollfd, 1, -1)); /* Wait with infinite timeout */
+        if (!blocking)
+            CHECK(poll(&pollfd, 1, -1)); /* Wait with infinite timeout */
 
-        if (pollfd.revents & POLLIN) {
+        if (pollfd.revents & POLLIN || (blocking && in)) {
             buf_size = CHECK(read(sock, buf, sizeof(buf) - 1));
-            printf("#%u: Read %d bytes\n", cnt, buf_size);
+            if (!quiet)
+                printf("#%u: Read %d bytes\n", cnt, buf_size);
             if (validate_seq) {
                 unsigned cnt_rcvd = 0;
                 buf[buf_size] = 0;
@@ -101,7 +122,7 @@ int main(int argc, char *argv[])
             if (out)
                 pollfd.events |= POLLOUT; /* Start writing only after reception of data */
         }
-        if (pollfd.revents & POLLOUT) {
+            if (pollfd.revents & POLLOUT || (blocking && out)) {
             if (!in) {
                 char str[200];
                 sprintf(str, "Hello%u", cnt);
@@ -109,7 +130,8 @@ int main(int argc, char *argv[])
             } else {
                 ret = CHECK(write(sock, buf, buf_size));
             }
-            printf("#%u: Wrote %d bytes\n", cnt, ret);
+            if (!quiet)
+                printf("#%u: Wrote %d bytes\n", cnt, ret);
         }
     } while (cnt++ < max_msgs || max_msgs == 0);
 
